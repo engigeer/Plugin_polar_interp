@@ -19,11 +19,14 @@
 #include "polar_interp.h"
 
 static bool polar_enabled = false;
+static bool jog_cancel = false;
 
 static on_report_options_ptr on_report_options;
 static user_mcode_ptrs_t user_mcode;
 
 #define ROTARY_AXIS A_AXIS
+
+#define MAX_SEG_LENGTH_MM 0.5f
 
 static coord_data_t start_virtual;    // current virtual (Y, Z) — persists across calls, seeded at enable
 static float last_a_real = 0.0f;      // unwrapped real A, radians
@@ -48,22 +51,25 @@ static void polar_resolve (float y, float z, float *z_real_out, float *a_real_ou
     float dz = z - gc_state.modal.g5x_offset.data.coord.values[Z_AXIS];
     float r  = sqrtf(dy * dy + dz * dz);
 
-    // if(r < POLE_EPSILON) {
-    //     *a_real_out = last_a_real;
-    //     *z_real_out = pole_offset;
-    //     return;
-    // }
+    if(r < 1E-2f) {
+        *a_real_out = last_a_real;
+        *z_real_out = gc_state.modal.g5x_offset.data.coord.values[Z_AXIS];   // TODO: settings.min_radius_for_step_calc
+        return;
+    }
 
     float candidate_angle = atan2f(dy, -dz);
     float delta_direct  = angle_diff(candidate_angle, last_a_real);
     //float delta_flipped = angle_diff(candidate_angle + (float)M_PI, last_a_real);
 
+    *z_real_out = -r + gc_state.modal.g5x_offset.data.coord.values[Z_AXIS];
+    last_a_real += delta_direct;
+
     // if(fabsf(delta_flipped) < fabsf(delta_direct)) {
     //    last_a_real += delta_flipped;
-        *z_real_out = -r + gc_state.modal.g5x_offset.data.coord.values[Z_AXIS];
+    //    *z_real_out = -r + gc_state.modal.g5x_offset.data.coord.values[Z_AXIS];
     // } else {
-        last_a_real += delta_direct;
-    //     *z_real_out = pole_offset + r;
+    //    last_a_real += delta_direct;
+    //     *z_real_out = +r;
     // }
 
     *a_real_out = last_a_real;
@@ -96,22 +102,11 @@ static coord_data_t *polarStepsToCartesianOn (coord_data_t *position, mpos_t *st
     return position;
 }
 
-static uint32_t polar_calc_segments (float z0, float z1)
+static uint32_t polar_calc_segments (float dz, float dy)
 {
-    float len = fabsf(z1 - z0);
+    float len = sqrtf(dz * dz + dy * dy);
 
-    float r0 = fabsf(z0);
-    float r1 = fabsf(z1);
-    float min_r = fmaxf(fminf(r0, r1), 5.0f);   // TODO: settings.min_radius_for_step_calc
-
-    float max_a_step_rad = (float)(2.0 * M_PI / 180.0);   // TODO: settings.max_a_step_deg
-    uint32_t n_by_angle = (uint32_t)ceilf((len / min_r) / max_a_step_rad);
-
-    float max_segment_len = 0.5f;   // TODO: settings.max_segment_len
-    uint32_t n_by_len = (uint32_t)ceilf(len / max_segment_len);
-
-    uint32_t n = n_by_angle > n_by_len ? n_by_angle : n_by_len;
-    return n < 1 ? 1 : n;
+    return (uint32_t)ceilf(len / MAX_SEG_LENGTH_MM);
 }
 
 static coord_data_t *polarSegmentLineOff (coord_data_t *target, coord_data_t *position, plan_line_data_t *pl_data, bool init)
@@ -129,6 +124,8 @@ static coord_data_t *polarSegmentLineOff (coord_data_t *target, coord_data_t *po
 
 static coord_data_t *polarSegmentLineOn (coord_data_t *target, coord_data_t *position, plan_line_data_t *pl_data, bool init)
 {
+    bool passthru = false;
+    
     if(init) {
 
         // tolerance
@@ -145,49 +142,57 @@ static coord_data_t *polarSegmentLineOn (coord_data_t *target, coord_data_t *pos
         real_target.values[ROTARY_AXIS] = position->values[ROTARY_AXIS];  // No commanded A-axis movement while polar interpolation is active
 
         if((fabsf(seg_end_z - seg_start_z) < eps) && (fabsf(seg_end_y - seg_start_y) < eps)) {
-            seg_count = 0;
-            return &real_target;   // no radial change — Z/Y untouched, one pass-through result
+            passthru = true;
+            seg_end_z = seg_start_z;
+            seg_end_y = seg_start_y;
+            seg_count = 1;
+        } else {
+            seg_count = polar_calc_segments(seg_end_z-seg_start_z, seg_end_y-seg_start_y);
+            prev_z_real = position->values[Z_AXIS];
+            prev_a_real_deg = position->values[ROTARY_AXIS];
+        }
+    } else {
+
+        if(passthru) {
+            seg_index++;
+            passthru = false;
+            return &real_target;
+        } else if(seg_index >= seg_count) {
+            start_virtual.values[Z_AXIS] = seg_end_z;
+            start_virtual.values[Y_AXIS] = seg_end_y;
+            return NULL;
         }
 
-        seg_count = 5;//polar_calc_segments(seg_start_z, seg_end_z); //temporary hard code
+        float t0 = (float)seg_index / (float)seg_count;
+        float z0 = seg_start_z + t0 * (seg_end_z - seg_start_z);
+        float y0 = seg_start_y + t0 * (seg_end_y - seg_start_y);
 
-        prev_z_real = position->values[Z_AXIS];
-        prev_a_real_deg = position->values[ROTARY_AXIS];
+        seg_index++;
+        float t1 = (float)seg_index / (float)seg_count;
+        float z1 = seg_start_z + t1 * (seg_end_z - seg_start_z);
+        float y1 = seg_start_y + t1 * (seg_end_y - seg_start_y);
+
+        float z_real, a_real_rad;
+        polar_resolve(y1, z1, &z_real, &a_real_rad);  
+        float a_real_deg = a_real_rad * (float)(180.0 / M_PI);  
+
+        real_target.values[Z_AXIS] = z_real;  
+        real_target.values[ROTARY_AXIS] = a_real_deg;
+
+        // TODO: confirm how this works if there are Z or A only movements and effect of ROTARY_FIX_ENABLE
+        float virtual_step = fabsf(z1 - z0);
+        float dz_real = z_real - prev_z_real;
+        float da_real_rad = (a_real_deg - prev_a_real_deg) * (float)(M_PI / 180.0);
+        float real_step = sqrtf(dz_real * dz_real + (da_real_rad * (z_real)) * (da_real_rad * (z_real)));
+
+        pl_data->rate_multiplier = virtual_step > 0.0f ? real_step / virtual_step : 1.0f;
+
+        prev_z_real = z_real;
+        prev_a_real_deg = a_real_deg;
     }
 
-    if(seg_index >= seg_count) {
-        start_virtual.values[Z_AXIS] = seg_end_z;
-        start_virtual.values[Y_AXIS] = seg_end_y;
-        return NULL;
-    }
-
-    float t0 = (float)seg_index / (float)seg_count;
-    float z0 = seg_start_z + t0 * (seg_end_z - seg_start_z);
-    float y0 = seg_start_y + t0 * (seg_end_y - seg_start_y);
-
-    seg_index++;
-    float t1 = (float)seg_index / (float)seg_count;
-    float z1 = seg_start_z + t1 * (seg_end_z - seg_start_z);
-    float y1 = seg_start_y + t1 * (seg_end_y - seg_start_y);
-
-    float z_real, a_real_rad;
-    polar_resolve(y1, z1, &z_real, &a_real_rad);  
-    float a_real_deg = a_real_rad * (float)(180.0 / M_PI);  
-
-    real_target.values[Z_AXIS] = z_real;  
-    real_target.values[ROTARY_AXIS] = a_real_deg;
-
-    float virtual_step = fabsf(z1 - z0);
-    float dz_real = z_real - prev_z_real;
-    float da_real_rad = (a_real_deg - prev_a_real_deg) * (float)(M_PI / 180.0);
-    float real_step = sqrtf(dz_real * dz_real + (da_real_rad * (z_real)) * (da_real_rad * (z_real)));
-
-    pl_data->rate_multiplier = virtual_step > 0.0f ? real_step / virtual_step : 1.0f;
-
-    prev_z_real = z_real;
-    prev_a_real_deg = a_real_deg;
-
-    return &real_target;
+    //TODO: add case for no movement? to return NULL
+    return jog_cancel ? NULL : &real_target;
 }
 
 static uint_fast8_t polarGetAxisMask (uint_fast8_t idx)
@@ -288,6 +293,12 @@ static void userMCodeExecute (uint_fast16_t state, parser_block_t *gc_block)
     user_mcode.execute(state, gc_block);
 }
 
+//TODO: continue handling chain
+static void cancel_jog (sys_state_t state)
+{
+    jog_cancel = true;
+}
+
 static void report_options (bool newopt)
 {
     on_report_options(newopt);
@@ -315,6 +326,9 @@ void polar_interp_init(void)
     grbl.user_mcode.validate = userMCodeValidate;
     grbl.user_mcode.execute = userMCodeExecute;
 
+    grbl.on_jog_cancel = cancel_jog;
+
+    //TODO: implement on program completed and on reset to exit polar interp mode
     on_report_options = grbl.on_report_options;
     grbl.on_report_options = report_options;
 }
