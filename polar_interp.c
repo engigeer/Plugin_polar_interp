@@ -58,6 +58,11 @@
   While polar mode is on, reported Y/Z positions are virtual coordinates, and A is
   the real A position.
 
+  The polar angle is measured from work A0: zero A (e.g. G10 L20 P0 A0) with the
+  part oriented the way the program expects before M112.
+
+  Jogging ($J=, including pendant/MPG jogs) is rejected while polar mode is on.
+
   Notes
   -----
   - If Z is on the centreline when polar mode is turned on, the side can't be
@@ -103,7 +108,8 @@ static user_mcode_ptrs_t user_mcode;
 #define POLAR_Y_TOLERANCE 1E-2f // max real Y distance from the pole accepted by M112 (mm)
 
 static coord_data_t start_virtual;    // virtual (Y, Z) at start of the current move, derived from planner position in init
-static float last_a_real = 0.0f;      // unwrapped real A, radians, derived from planner position in init
+static float last_a_real = 0.0f;      // unwrapped polar angle from work A0, radians, derived from planner position in init
+static float a_offset = 0.0f;         // A work offset (G5x + G92) for the current move, degrees
 static float polar_side = 1.0f;       // side of the pole the tool works on, latched at M112:
                                       // +1 = Z_real below pole (-Z side), -1 = above (+Z side)
 
@@ -126,6 +132,8 @@ static inline float angle_diff (float a, float b)
 // all offsets applied: G5x + G92 + tool length offset. Program targets carry the same
 // offsets, so target - pole is always the programmed Y/Z regardless of how they are set,
 // and a tool length change mid-program moves the pole with the tool.
+// For A (ROTARY_AXIS) this is the A work offset: the polar angle is measured from work
+// A0, so zeroing A on the part sets the orientation of the virtual Y/Z plane.
 // real_time = true uses the offsets of the block currently executing (for reports while
 // motion with older offsets is still queued), false the offsets currently being parsed.
 static inline float polar_pole (uint_fast8_t idx, bool real_time)
@@ -164,7 +172,7 @@ static void polar_real_to_virtual (coord_data_t *pos, bool real_time)
 {
     float pole_z = polar_pole(Z_AXIS, real_time);
     float r = pole_z - pos->values[Z_AXIS];
-    float a = pos->values[ROTARY_AXIS] * RADDEG;
+    float a = (pos->values[ROTARY_AXIS] - polar_pole(ROTARY_AXIS, real_time)) * RADDEG;  // angle from work A0
 
     pos->values[Y_AXIS] = polar_pole(Y_AXIS, real_time) + r * sinf(a);
     pos->values[Z_AXIS] = pole_z - r * cosf(a);
@@ -263,7 +271,8 @@ static coord_data_t *polarSegmentLineOn (coord_data_t *target, coord_data_t *pos
 
         // Derive the start point from the planner position (raw machine Z/A), not from
         // remembered state, so any resync (jog cancel, probe, feed hold...) is picked up.
-        last_a_real = position->values[ROTARY_AXIS] * RADDEG;
+        a_offset = polar_pole(ROTARY_AXIS, false);
+        last_a_real = (position->values[ROTARY_AXIS] - a_offset) * RADDEG;
         memcpy(&start_virtual, position, sizeof(coord_data_t));
         polar_real_to_virtual(&start_virtual, false);
 
@@ -315,7 +324,7 @@ static coord_data_t *polarSegmentLineOn (coord_data_t *target, coord_data_t *pos
         last_a_real = a_start;
 
         real_target.values[Z_AXIS] = z_end;
-        real_target.values[ROTARY_AXIS] = a_end_rad * DEGRAD;
+        real_target.values[ROTARY_AXIS] = a_end_rad * DEGRAD + a_offset;
     } else {
 
         // Stop feeding segments once a jog is cancelled. Only checked here, never on the
@@ -333,7 +342,7 @@ static coord_data_t *polarSegmentLineOn (coord_data_t *target, coord_data_t *pos
 
         float z_real, a_real_rad;
         polar_resolve(y1, z1, &z_real, &a_real_rad);  
-        float a_real_deg = a_real_rad * (float)(180.0 / M_PI);  
+        float a_real_deg = a_real_rad * DEGRAD + a_offset;  // work angle -> machine A
 
         real_target.values[Z_AXIS] = z_real;
         real_target.values[ROTARY_AXIS] = a_real_deg;
@@ -534,6 +543,30 @@ static void userMCodeExecute (uint_fast16_t state, parser_block_t *gc_block)
         user_mcode.execute(state, gc_block);
 }
 
+// Jogging is not supported while polar mode is on: jog soft limits, travel clipping and
+// DTG all work on the (virtual) jog target as if it were real machine coordinates.
+// Plugin commands are searched before core's, so this sees every $J= (console, sender,
+// and keypad/MPG jogs, which are enqueued as $J= lines). Returning Status_Unhandled
+// passes the command on to core's own $J handler unchanged.
+static status_code_t polarJog (sys_state_t state, char *args)
+{
+    if(!polar_enabled)
+        return Status_Unhandled;
+
+    report_message("Polar: jogging is disabled while polar interpolation is on (M113 first)", Message_Warning);
+
+    return Status_InvalidStatement;
+}
+
+static const sys_command_t polar_command_list[] = {
+    { "J", polarJog, {} }   // no help entry - core lists $J
+};
+
+static sys_commands_t polar_commands = {
+    .n_commands = sizeof(polar_command_list) / sizeof(sys_command_t),
+    .commands = polar_command_list
+};
+
 // Called from interrupt context.
 static void onJogCancel (sys_state_t state)
 {
@@ -621,6 +654,8 @@ void polar_interp_init(void)
 
     check_travel_limits = grbl.check_travel_limits;
     grbl.check_travel_limits = polarCheckTravelLimits;
+
+    system_register_commands(&polar_commands);
 
     on_report_options = grbl.on_report_options;
     grbl.on_report_options = report_options;
