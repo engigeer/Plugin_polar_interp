@@ -555,7 +555,7 @@ static status_code_t polarJog (sys_state_t state, char *args)
 
     report_message("Polar: jogging is disabled while polar interpolation is on (M113 first)", Message_Warning);
 
-    return Status_InvalidStatement;
+    return Status_InvalidJogCommand;
 }
 
 static const sys_command_t polar_command_list[] = {
@@ -616,16 +616,13 @@ static void report_options (bool newopt)
     on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("Polar Interpolation", "0.02");
+        report_plugin("Polar Interpolation", "0.03");
 }
 
 
 void polar_interp_init(void)
 {
     kinematics.transform_from_cartesian = polarTransformFromCartesian;
-    kinematics.transform_steps_to_cartesian = polarStepsToCartesianOff;
-    kinematics.segment_line = polarSegmentLineOff;
-
     kinematics.limits_set_target_pos = polarSetTargetPos;
     kinematics.limits_get_axis_mask = polarGetAxisMask;
     kinematics.limits_set_machine_positions = polarSetMachinePositions;
